@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0, viewport-fit=cover">
+	<title>Wobble Brawl</title>
+	<style>
+html, body, #canvas { margin: 0; padding: 0; border: 0; }
+body {
+	color: #fff;
+	background: #120c1f;
+	overflow: hidden;
+	touch-action: none;
+	font-family: -apple-system, 'Segoe UI', Roboto, Arial, sans-serif;
+}
+#canvas { display: block; }
+#canvas:focus { outline: none; }
+#loader {
+	position: absolute; inset: 0;
+	display: flex; flex-direction: column; align-items: center; justify-content: center;
+	gap: 14px; padding: 24px; text-align: center;
+	background: radial-gradient(circle at 50% 40%, #2a1d45 0%, #120c1f 70%);
+}
+#title {
+	font-size: clamp(32px, 9vw, 64px); font-weight: 900; line-height: 0.95;
+	color: #ffd75a; letter-spacing: 1px;
+	text-shadow: 0 4px 0 #1a0f22, 3px 3px 0 #1a0f22, -3px 3px 0 #1a0f22, 3px -3px 0 #1a0f22, -3px -3px 0 #1a0f22;
+}
+#bar { width: min(420px, 80vw); height: 16px; border-radius: 8px; background: #2b2140; border: 3px solid #1a0f22; overflow: hidden; }
+#fill { height: 100%; width: 0%; background: linear-gradient(90deg, #ff8a26, #ffd75a); transition: width 0.3s; }
+#line { font-size: 17px; font-weight: 700; min-height: 22px; }
+#hint { font-size: 14px; opacity: 0.7; max-width: 420px; line-height: 1.35; }
+#line.problem { color: #ff9a8a; }
+#log {
+	font: 11px/1.35 ui-monospace, Menlo, Consolas, monospace; color: #b9aed6; text-align: left;
+	max-width: min(560px, 92vw); white-space: pre-wrap; word-break: break-word; opacity: 0.85;
+}
+	</style>
+	<link id="-gd-engine-icon" rel="icon" type="image/png" href="index.icon.png" />
+<link rel="apple-touch-icon" href="index.apple-touch-icon.png"/>
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Wobble Brawl">
+</head>
+<body>
+	<canvas id="canvas">Your browser does not support the canvas tag.</canvas>
+	<noscript>Your browser does not support JavaScript.</noscript>
+	<div id="loader">
+		<div id="title">WOBBLE<br>BRAWL</div>
+		<div id="bar"><div id="fill"></div></div>
+		<div id="line">Loading…</div>
+		<div id="hint">First visit downloads about 14 MB. On a slow connection this can take a few minutes; later visits are usually quicker.</div>
+		<div id="log"></div>
+	</div>
+
+	<script>
+// Sound on phones. Browsers keep audio locked until the player touches the
+// screen; iPhones also keep web audio silent while the ring/silent switch is
+// on silent, and pause it when you switch apps. So: ask for "playback" audio
+// (plays like a game or video, whatever the switch says), and on every touch
+// wake up any audio the engine made that isn't running.
+(function () {
+	const contexts = [];
+	const Native = window.AudioContext || window.webkitAudioContext;
+	if (Native) {
+		const Tracked = function (...args) {
+			const c = new Native(...args);
+			contexts.push(c);
+			return c;
+		};
+		Tracked.prototype = Native.prototype;
+		window.AudioContext = Tracked;
+		if (window.webkitAudioContext) {
+			window.webkitAudioContext = Tracked;
+		}
+	}
+	function wake() {
+		if (navigator.audioSession && navigator.audioSession.type !== 'playback') {
+			try { navigator.audioSession.type = 'playback'; } catch (e) { /* older Safari */ }
+		}
+		for (const c of contexts) {
+			if (c.state !== 'running' && c.state !== 'closed') {
+				c.resume().catch(() => {});
+			}
+		}
+	}
+	wake();
+	for (const ev of ['touchend', 'pointerup', 'mousedown', 'keydown']) {
+		window.addEventListener(ev, wake, { capture: true, passive: true });
+	}
+	document.addEventListener('visibilitychange', () => { if (!document.hidden) wake(); });
+}());
+	</script>
+	<script src="index.js"></script>
+	<script>
+const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":false,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":6467852,"index.wasm":39514754},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4};
+const GODOT_THREADS_ENABLED = false;
+
+(function () {
+	const loader = document.getElementById('loader');
+	const fill = document.getElementById('fill');
+	const line = document.getElementById('line');
+	const hint = document.getElementById('hint');
+	const start = Date.now();
+	let percent = 0;
+	let lastChange = Date.now();
+	let downloaded = false;
+	let failed = false;
+
+	// Earlier versions installed a service worker that cached the game and
+	// downloaded everything twice; remove it and its caches
+	if ('serviceWorker' in navigator) {
+		navigator.serviceWorker.getRegistrations().then((list) => list.forEach((r) => r.unregister())).catch(() => {});
+	}
+	if (window.caches) {
+		caches.keys().then((keys) => keys.forEach((k) => caches.delete(k))).catch(() => {});
+	}
+
+	// While loading, the engine's own messages appear under the bar (a
+	// screenshot then shows exactly how far it got on a phone)
+	const logBox = document.getElementById('log');
+	const logLines = [];
+	function addLog(kind, args) {
+		if (!loader.isConnected) {
+			return;
+		}
+		const t = ((Date.now() - start) / 1000).toFixed(1);
+		const text = Array.from(args).map((a) => (a instanceof Error ? a.message : String(a))).join(' ');
+		logLines.push(t + 's ' + (kind === 'log' ? '' : kind.toUpperCase() + ' ') + text.slice(0, 160));
+		logBox.textContent = logLines.slice(-10).join('\n');
+	}
+	for (const kind of ['log', 'warn', 'error']) {
+		const original = console[kind].bind(console);
+		console[kind] = function () {
+			addLog(kind, arguments);
+			original.apply(null, arguments);
+		};
+	}
+	window.addEventListener('unhandledrejection', (e) => addLog('error', [e.reason]));
+	const realFetch = window.fetch.bind(window);
+	window.fetch = function (resource, init) {
+		const name = String(resource && resource.url ? resource.url : resource).split('/').pop();
+		addLog('log', ['fetch ' + name]);
+		return realFetch(resource, init).then((response) => {
+			addLog('log', [name + ': HTTP ' + response.status]);
+			return response;
+		}, (err) => {
+			addLog('error', [name + ': ' + err]);
+			throw err;
+		});
+	};
+
+	function clock() {
+		const s = Math.floor((Date.now() - start) / 1000);
+		return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+	}
+
+	function show(text, problem) {
+		line.textContent = text;
+		line.className = problem ? 'problem' : '';
+	}
+
+	function fail(err) {
+		failed = true;
+		console.error(err);
+		const msg = err instanceof Error ? err.message : String(err || 'Unknown error');
+		show('Could not start: ' + msg, true);
+		hint.textContent = 'Please send a screenshot of this message.';
+	}
+
+	window.addEventListener('error', (e) => { if (!failed && loader.isConnected) fail(e.message); });
+
+	const ticker = setInterval(() => {
+		if (failed || !loader.isConnected) { clearInterval(ticker); return; }
+		// Safari may stop counting just short of 100%: from 95% on, the phone
+		// is preparing the engine and the first scene, not downloading
+		if (downloaded || percent >= 95) {
+			show('Starting the game… ' + clock() + '  (phones need a moment here)');
+		} else if (Date.now() - lastChange > 15000) {
+			show('No data for ' + Math.round((Date.now() - lastChange) / 1000) + ' s: the connection seems stuck. Check your internet, then reload. (' + percent + '%)', true);
+		} else {
+			show('Loading ' + percent + '%   ·   ' + clock());
+		}
+	}, 500);
+
+	const missing = Engine.getMissingFeatures({ threads: GODOT_THREADS_ENABLED });
+	if (missing.length !== 0) {
+		fail('This browser is missing: ' + missing.join(', '));
+		return;
+	}
+	const engine = new Engine(GODOT_CONFIG);
+	engine.startGame({
+		'onProgress': function (current, total) {
+			if (current > 0 && total > 0) {
+				const p = Math.min(100, Math.floor(100 * current / total));
+				if (p !== percent) {
+					percent = p;
+					lastChange = Date.now();
+				}
+				fill.style.width = p + '%';
+				if (current >= total && !downloaded) {
+					downloaded = true;
+					addLog('log', ['download complete']);
+				}
+			}
+		},
+	}).then(() => {
+		addLog('log', ['engine started']);
+		clearInterval(ticker);
+		// Keep the loader (with its log) until the game draws its first frames
+		setTimeout(() => loader.remove(), 300);
+	}, fail);
+}());
+	</script>
+</body>
+</html>
+
